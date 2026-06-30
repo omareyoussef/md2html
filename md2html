@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""
+md-to-html — Convert markdown files to printer-friendly HTML.
+No dependencies. Just Python 3.
+
+Usage:
+  ./md-to-html <file-or-folder> [destination-folder]
+
+Examples:
+  ./md-to-html README.md                   # → README.html in the same directory
+  ./md-to-html notes/                       # → converts all .md files in notes/
+  ./md-to-html notes/ build/                # → writes HTML files to build/
+  ./md-to-html README.md build/             # → build/README.html
+"""
+
+import sys, os, re, html
+
+# ───────────────────────────────────────────────────────────────────────────
+# CLI
+# ───────────────────────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: md-to-html <file-or-folder> [destination-folder]")
+        sys.exit(1)
+
+    src = os.path.abspath(sys.argv[1])
+    dest = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
+
+    if not os.path.exists(src):
+        print(f"Not found: {src}")
+        sys.exit(1)
+
+    if os.path.isdir(src):
+        files = sorted(
+            os.path.join(src, f) for f in os.listdir(src) if f.endswith(".md")
+        )
+    else:
+        files = [src]
+
+    if not files:
+        print("No .md files found.")
+        sys.exit(1)
+
+    if dest and not os.path.exists(dest):
+        os.makedirs(dest, exist_ok=True)
+
+    for fpath in files:
+        md = open(fpath, encoding="utf-8").read()
+        body = md_to_html(md)
+        title = extract_title(md, fpath)
+        out_html = wrap_html(title, body)
+
+        name = os.path.splitext(os.path.basename(fpath))[0] + ".html"
+        out_path = os.path.join(dest, name) if dest else os.path.join(os.path.dirname(fpath), name)
+        open(out_path, "w", encoding="utf-8").write(out_html)
+
+        rel_in = os.path.relpath(fpath)
+        rel_out = os.path.relpath(out_path)
+        print(f"  {rel_in} → {rel_out}")
+
+    print(f"\nConverted {len(files)} file{'s' if len(files) != 1 else ''}.")
+
+
+def extract_title(md, fpath):
+    m = re.search(r"^#\s+(.+)", md, re.MULTILINE)
+    if m:
+        return re.sub(r"[*_`]", "", m.group(1))
+    return os.path.splitext(os.path.basename(fpath))[0]
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Markdown → HTML  (no dependencies)
+# ───────────────────────────────────────────────────────────────────────────
+
+def md_to_html(md):
+    lines = md.split("\n")
+    out = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # ── Fenced code block ──
+        m = re.match(r"^(`{3,}|~{3,})\s*(.*)", line)
+        if m:
+            fence, lang = m.group(1), m.group(2).strip()
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].startswith(fence[0] * len(fence)):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence
+            code = html.escape("\n".join(code_lines))
+            cls = ' class="file-tree"' if lang in ("tree", "plaintext", "") and _looks_like_tree(code_lines) else ""
+            out.append(f"<pre{cls}><code>{code}</code></pre>")
+            continue
+
+        # ── Heading ──
+        m = re.match(r"^(#{1,6})\s+(.*)", line)
+        if m:
+            depth = len(m.group(1))
+            text = inline(m.group(2))
+            slug = slugify(m.group(2))
+            out.append(f'<h{depth} id="{slug}">{text}</h{depth}>')
+            i += 1
+            continue
+
+        # ── Horizontal rule ──
+        if re.match(r"^(\*{3,}|-{3,}|_{3,})\s*$", line):
+            out.append("<hr>")
+            i += 1
+            continue
+
+        # ── Table (with header + separator) ──
+        if i + 1 < len(lines) and re.match(r"^\|(.+)\|", line) and re.match(r"^\|[\s:|-]+\|", lines[i + 1]):
+            table_lines = []
+            while i < len(lines) and re.match(r"^\|(.+)\|", lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            out.append(parse_table(table_lines))
+            continue
+
+        # ── Orphan table rows (continuation rows without a header) ──
+        if re.match(r"^\|(.+)\|", line):
+            table_lines = []
+            while i < len(lines) and re.match(r"^\|(.+)\|", lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            out.append(parse_table_bodyonly(table_lines))
+            continue
+
+        # ── Blockquote ──
+        if line.startswith(">"):
+            bq_lines = []
+            while i < len(lines) and (lines[i].startswith(">") or (lines[i].strip() and bq_lines and not _is_block_start(lines[i]))):
+                bq_lines.append(re.sub(r"^>\s?", "", lines[i]))
+                i += 1
+            inner = md_to_html("\n".join(bq_lines))
+            out.append(f"<blockquote>{inner}</blockquote>")
+            continue
+
+        # ── Unordered list ──
+        if re.match(r"^(\s*)([-*+])\s", line):
+            block, i = collect_list_block(lines, i)
+            out.append(parse_list(block, ordered=False))
+            continue
+
+        # ── Ordered list ──
+        if re.match(r"^(\s*)\d+[.)]\s", line):
+            block, i = collect_list_block(lines, i)
+            out.append(parse_list(block, ordered=True))
+            continue
+
+        # ── Blank line ──
+        if not line.strip():
+            i += 1
+            continue
+
+        # ── Paragraph (default) ──
+        para_lines = []
+        while i < len(lines) and lines[i].strip() and not _is_block_start(lines[i]):
+            para_lines.append(lines[i])
+            i += 1
+        out.append(f"<p>{inline(' '.join(para_lines))}</p>")
+
+    return "\n".join(out)
+
+
+def _is_block_start(line):
+    """Return True if this line starts a new block element."""
+    if re.match(r"^#{1,6}\s", line): return True
+    if re.match(r"^(`{3,}|~{3,})", line): return True
+    if re.match(r"^(\*{3,}|-{3,}|_{3,})\s*$", line): return True
+    if re.match(r"^\|.+\|", line): return True
+    if line.startswith(">"): return True
+    if re.match(r"^\s*[-*+]\s", line): return True
+    if re.match(r"^\s*\d+[.)]\s", line): return True
+    return False
+
+
+def _looks_like_tree(code_lines):
+    """Heuristic: is this code block a file tree?"""
+    tree_chars = 0
+    for l in code_lines[:20]:
+        if any(c in l for c in ("├", "└", "│", "─")):
+            tree_chars += 1
+    return tree_chars >= 2
+
+
+# ── Inline formatting ──
+
+# Single pass tokenizer — avoids catastrophic backtracking from nested/overlapping
+# markers (e.g. **bold with `code` inside**).
+
+_INLINE_RE = re.compile(
+    r"(?P<code>`[^`]+`)"                          # `code`
+    r"|(?P<img>!\[[^\]]*\]\([^)]+\))"              # ![alt](url)
+    r"|(?P<link>\[[^\]]+\]\([^)]+\))"              # [text](url)
+    r"|(?P<bold_italic>\*{3}(?P<bi>.+?)\*{3})"     # ***bold italic***
+    r"|(?P<bold>\*{2}(?P<b>.+?)\*{2})"             # **bold**
+    r"|(?P<ubold>__(?P<ub>.+?)__)"                 # __bold__
+    r"|(?P<italic>(?<!\w)\*(?P<i>[^*]+)\*(?!\w))"  # *italic*
+    r"|(?P<uital>(?<!\w)_(?P<ui>[^_]+)_(?!\w))"    # _italic_
+    r"|(?P<strike>~~(?P<s>[^~]+)~~)"               # ~~strike~~
+)
+
+def inline(text):
+    text = text.replace("\\|", "|")
+    out = []
+    last = 0
+    for m in _INLINE_RE.finditer(text):
+        # Append plain text before this match
+        if m.start() > last:
+            out.append(text[last : m.start()])
+
+        if m.group("code"):
+            inner = m.group("code")[1:-1]  # strip backticks
+            out.append(f"<code>{html.escape(inner)}</code>")
+        elif m.group("img"):
+            alt = re.search(r"\[([^\]]*)\]", m.group("img")).group(1)
+            src = re.search(r"\(([^)]+)\)", m.group("img")).group(1)
+            out.append(f'<img src="{src}" alt="{alt}">')
+        elif m.group("link"):
+            txt = re.search(r"\[([^\]]+)\]", m.group("link")).group(1)
+            href = re.search(r"\(([^)]+)\)", m.group("link")).group(1)
+            out.append(f'<a href="{href}">{inline(txt)}</a>')
+        elif m.group("bold_italic"):
+            out.append(f"<strong><em>{inline(m.group('bi'))}</em></strong>")
+        elif m.group("bold"):
+            out.append(f"<strong>{inline(m.group('b'))}</strong>")
+        elif m.group("ubold"):
+            out.append(f"<strong>{inline(m.group('ub'))}</strong>")
+        elif m.group("italic"):
+            out.append(f"<em>{inline(m.group('i'))}</em>")
+        elif m.group("uital"):
+            out.append(f"<em>{inline(m.group('ui'))}</em>")
+        elif m.group("strike"):
+            out.append(f"<del>{inline(m.group('s'))}</del>")
+
+        last = m.end()
+
+    # Remaining plain text
+    if last < len(text):
+        out.append(text[last:])
+
+    return "".join(out)
+
+
+# ── Tables ──
+
+def split_table_row(line):
+    """Split a markdown table row on | delimiters, respecting `code spans`."""
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+
+    cells = []
+    current = []
+    in_code = False
+    for ch in line:
+        if ch == "`":
+            in_code = not in_code
+            current.append(ch)
+        elif ch == "|" and not in_code:
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    cells.append("".join(current).strip())
+    return cells
+
+
+def parse_table(table_lines):
+    rows = [split_table_row(line) for line in table_lines]
+
+    # rows[0] = header, rows[1] = separator, rows[2:] = body
+    if len(rows) < 2:
+        return ""
+
+    header = rows[0]
+    body = rows[2:]
+
+    parts = ["<table>", "<thead><tr>"]
+    for cell in header:
+        parts.append(f"<th>{inline(cell)}</th>")
+    parts.append("</tr></thead>")
+    parts.append("<tbody>")
+    for row in body:
+        parts.append("<tr>")
+        for cell in row:
+            parts.append(f"<td>{inline(cell)}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "\n".join(parts)
+
+
+def parse_table_bodyonly(table_lines):
+    """Render table rows that appear without a header/separator (split tables)."""
+    parts = ["<table><tbody>"]
+    for line in table_lines:
+        cells = split_table_row(line)
+        parts.append("<tr>")
+        for cell in cells:
+            parts.append(f"<td>{inline(cell)}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "\n".join(parts)
+
+
+# ── Lists ──
+
+def collect_list_block(lines, i):
+    """Collect all contiguous list lines (including nested and continuation lines)."""
+    block = []
+    base_indent = len(lines[i]) - len(lines[i].lstrip())
+
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            # blank line — include if next line is indented (continuation)
+            if i + 1 < len(lines) and len(lines[i + 1]) - len(lines[i + 1].lstrip()) > base_indent:
+                block.append(line)
+                i += 1
+                continue
+            break
+        indent = len(line) - len(line.lstrip())
+        if indent < base_indent and not re.match(r"^\s*[-*+]\s|\s*\d+[.)]\s", line):
+            break
+        if indent == base_indent and not re.match(r"^\s*[-*+]\s|\s*\d+[.)]\s", line):
+            break
+        block.append(line)
+        i += 1
+
+    return block, i
+
+
+def parse_list(block, ordered=False):
+    """Parse a list block into nested <ul>/<ol> HTML."""
+    items = []
+    tag = "ol" if ordered else "ul"
+
+    # Group lines into items by detecting list markers at current indent
+    if not block:
+        return ""
+
+    base_indent = len(block[0]) - len(block[0].lstrip())
+
+    current_item = None
+    current_children = []
+
+    for line in block:
+        indent = len(line) - len(line.lstrip())
+        stripped = line.strip()
+
+        is_item = False
+        item_text = ""
+
+        if not ordered and re.match(r"^[-*+]\s", stripped):
+            is_item = True
+            item_text = re.sub(r"^[-*+]\s", "", stripped)
+        elif ordered and re.match(r"^\d+[.)]\s", stripped):
+            is_item = True
+            item_text = re.sub(r"^\d+[.)]\s", "", stripped)
+
+        if is_item and indent == base_indent:
+            # Save previous item
+            if current_item is not None:
+                items.append((current_item, current_children))
+            current_item = item_text
+            current_children = []
+        elif current_item is not None:
+            current_children.append(line)
+
+    if current_item is not None:
+        items.append((current_item, current_children))
+
+    parts = [f"<{tag}>"]
+    for text, children in items:
+        # Task list
+        task = ""
+        if re.match(r"^\[[ xX]\]\s", text):
+            checked = text[1] in "xX"
+            text = text[4:]
+            sym = "&#9745;" if checked else "&#9744;"
+            task = f'<span class="check">{sym}</span> '
+
+        cls = ' class="task-item"' if task else ""
+        inner = inline(text)
+
+        if children:
+            child_block = children
+            child_ordered = any(re.match(r"^\s*\d+[.)]\s", l) for l in child_block if l.strip())
+            child_html = parse_list(child_block, ordered=child_ordered)
+            parts.append(f"<li{cls}>{task}{inner}{child_html}</li>")
+        else:
+            parts.append(f"<li{cls}>{task}{inner}</li>")
+
+    parts.append(f"</{tag}>")
+    return "\n".join(parts)
+
+
+# ── Helpers ──
+
+def slugify(text):
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[*_`\[\]()]", "", text)
+    text = re.sub(r"[^\w\s-]", "", text)
+    return re.sub(r"[\s]+", "-", text).strip("-").lower()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# HTML wrapper
+# ───────────────────────────────────────────────────────────────────────────
+
+def wrap_html(title, body):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{html.escape(title)}</title>
+<style>
+  /* Reset */
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  /* Base */
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.55;
+    color: #1a1a1a;
+    max-width: 8.5in;
+    margin: 0 auto;
+    padding: 0.5in;
+  }}
+
+  /* Headings */
+  h1 {{ font-size: 20pt; margin-top: 0; margin-bottom: 6pt; }}
+  h2 {{
+    font-size: 14pt;
+    margin-top: 24pt;
+    margin-bottom: 8pt;
+    border-bottom: 1.5pt solid #333;
+    padding-bottom: 4pt;
+    page-break-after: avoid;
+  }}
+  h3 {{ font-size: 12pt; margin-top: 16pt; margin-bottom: 6pt; page-break-after: avoid; }}
+  h4 {{ font-size: 11pt; margin-top: 12pt; margin-bottom: 4pt; font-weight: 600; }}
+  h5 {{ font-size: 10.5pt; margin-top: 10pt; margin-bottom: 4pt; font-weight: 600; }}
+  h6 {{ font-size: 10pt; margin-top: 8pt; margin-bottom: 4pt; font-weight: 600; color: #444; }}
+
+  /* Block elements */
+  p {{ margin-bottom: 6pt; }}
+  ul, ol {{ margin-left: 18pt; margin-bottom: 8pt; }}
+  li {{ margin-bottom: 3pt; }}
+  li > ul, li > ol {{ margin-top: 3pt; margin-bottom: 0; }}
+
+  hr {{
+    border: none;
+    border-top: 1pt solid #ccc;
+    margin: 18pt 0;
+  }}
+
+  blockquote {{
+    border-left: 3pt solid #ccc;
+    padding: 4pt 10pt;
+    margin: 8pt 0;
+    color: #444;
+    font-style: italic;
+    font-size: 10pt;
+  }}
+  blockquote p {{ margin-bottom: 4pt; }}
+  blockquote p:last-child {{ margin-bottom: 0; }}
+
+  /* Tables */
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 12pt;
+    font-size: 10pt;
+  }}
+  th, td {{
+    border: 0.5pt solid #999;
+    padding: 4pt 6pt;
+    text-align: left;
+    vertical-align: top;
+  }}
+  th {{ background-color: #f0f0f0; font-weight: 600; }}
+
+  /* Code */
+  code {{
+    font-family: "SF Mono", "Fira Code", Consolas, "Courier New", monospace;
+    font-size: 8.5pt;
+    background: #f4f4f4;
+    padding: 1pt 3pt;
+    border-radius: 2pt;
+  }}
+  pre {{
+    background: #f4f4f4;
+    border: 0.5pt solid #ccc;
+    padding: 8pt;
+    margin-bottom: 10pt;
+    overflow-x: auto;
+    font-size: 8.5pt;
+    line-height: 1.4;
+    page-break-inside: avoid;
+  }}
+  pre code {{
+    background: none;
+    padding: 0;
+    font-size: inherit;
+  }}
+  .file-tree {{
+    font-size: 8pt;
+    line-height: 1.3;
+    white-space: pre;
+  }}
+
+  /* Inline */
+  strong {{ font-weight: 600; }}
+  img {{ max-width: 100%; height: auto; }}
+  a {{ color: #1a1a1a; text-decoration: underline; }}
+
+  /* Task lists */
+  .task-item {{
+    list-style: none;
+    margin-left: -14pt;
+  }}
+  .task-item .check {{
+    font-size: 10pt;
+    margin-right: 3pt;
+  }}
+
+  /* Print */
+  @media print {{
+    body {{ padding: 0; font-size: 10pt; }}
+    a {{ text-decoration: none; }}
+    table {{ page-break-inside: avoid; }}
+    @page {{ margin: 0.6in 0.7in; }}
+  }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    main()
